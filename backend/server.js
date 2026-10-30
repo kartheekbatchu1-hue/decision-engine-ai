@@ -67,8 +67,9 @@ app.get('/health', (_req, res) => {
   });
 });
 
-// Routes
+// Routes (supporting both /api/decisions and /decisions)
 app.use('/api/decisions', decisionRoutes);
+app.use('/decisions', decisionRoutes);
 
 // 404
 app.use((req, res) => {
