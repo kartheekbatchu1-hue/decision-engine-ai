@@ -87,7 +87,7 @@ Principles:
 1. Objectivity — base scores strictly on provided data and objective industry standards.
 2. Trade-Off Clarity — explicitly highlight what each alternative sacrifices.
 3. Actionability — provide step-by-step mitigation for top risks.
-4. Structured Response — return ONLY valid JSON matching the exact schema. No markdown, no prose outside JSON.`;
+4. Structured Response — return ONLY valid JSON matching the exact schema. No markdown wrapping, no extra prose outside the JSON object.`;
 
 export async function analyzeDecisionModel(decisionData) {
   const userPrompt = `Analyze the following decision scenario with comprehensive MCDA:
@@ -105,25 +105,45 @@ ${JSON.stringify(decisionData.criteria, null, 2)}
 Instructions:
 1. Score each alternative against each criterion (0–10) with clear reasoning.
 2. Calculate total_weighted_score = Σ(score × weight) / Σ(weights) for each alternative.
-3. Identify 2–3 key risks per alternative with severity and actionable mitigation.
-4. Provide a confidence score (0–100) for your top recommendation.
-5. Write a concise executive summary (3–5 sentences) and a detailed trade-off analysis.
-6. List top failure modes and a 5-step action plan for the recommended option.`;
+3. Identify 2–3 key risks per alternative with severity (LOW, MEDIUM, HIGH, CRITICAL) and actionable mitigation.
+4. Provide a confidence_score (0–100) for your top recommendation.
+5. Write an executive_summary (3–5 sentences) and a detailed trade_off_analysis.
+6. Provide failure_modes (alternative_name, failure_scenario, probability [LOW, MEDIUM, HIGH], impact [LOW, MEDIUM, HIGH, CRITICAL]).
+7. Provide a 5-step action_plan (step_number, action, timeline, owner).
+
+You MUST return a JSON object with this exact structure:
+{
+  "recommended_option_name": "string",
+  "confidence_score": 85,
+  "scores": [
+    {
+      "alternative_name": "string",
+      "total_weighted_score": 8.5,
+      "criteria_breakdown": [
+        { "criterion_name": "string", "score_out_of_10": 8, "reasoning": "string" }
+      ]
+    }
+  ],
+  "risks": [
+    { "alternative_name": "string", "risk_factor": "string", "severity": "MEDIUM", "mitigation_strategy": "string" }
+  ],
+  "executive_summary": "string",
+  "trade_off_analysis": "string",
+  "failure_modes": [
+    { "alternative_name": "string", "failure_scenario": "string", "probability": "LOW", "impact": "HIGH" }
+  ],
+  "action_plan": [
+    { "step_number": 1, "action": "string", "timeline": "Week 1", "owner": "string" }
+  ]
+}`;
 
   const completion = await groq.chat.completions.create({
-    model: 'llama-3.3-70b-versatile',
+    model: 'openai/gpt-oss-120b',
     messages: [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: userPrompt },
     ],
-    response_format: {
-      type: 'json_schema',
-      json_schema: {
-        name: 'decision_analysis',
-        strict: true,
-        schema: ANALYSIS_SCHEMA,
-      },
-    },
+    response_format: { type: 'json_object' },
     temperature: 0.3,
     max_tokens: 4096,
   });

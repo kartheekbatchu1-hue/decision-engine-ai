@@ -7,6 +7,18 @@ function getUserId(req) {
   return req.headers['x-user-id'] || DEMO_USER_ID;
 }
 
+async function ensureUserExists(userId) {
+  try {
+    await supabase.from('users').upsert({
+      id: userId,
+      email: userId === DEMO_USER_ID ? 'demo@decisionengine.ai' : `user_${userId.slice(0, 8)}@decisionengine.ai`,
+      name: userId === DEMO_USER_ID ? 'Demo User' : 'DecisionEngine User',
+    }, { onConflict: 'id' });
+  } catch (_err) {
+    // Non-blocking fallback
+  }
+}
+
 // POST /api/decisions
 export async function createDecision(req, res) {
   try {
@@ -16,6 +28,8 @@ export async function createDecision(req, res) {
     if (!supabase) {
       return res.status(500).json({ error: 'Supabase client is not configured' });
     }
+
+    await ensureUserExists(userId);
 
     // 1. Insert decision model
     const { data: decision, error: dmError } = await supabase
