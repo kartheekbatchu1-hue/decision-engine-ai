@@ -42,6 +42,21 @@ app.use(express.urlencoded({ extended: true }));
 // Rate limiting
 app.use('/api/', generalLimiter);
 
+// Root info endpoint
+app.get('/', (_req, res) => {
+  res.json({
+    name: 'DecisionEngine AI API',
+    status: 'online',
+    version: '1.0.0',
+    frontend: 'http://localhost:5173',
+    message: 'Backend API is running. Open http://localhost:5173 in your browser to access the DecisionEngine UI.',
+    endpoints: {
+      health: '/health',
+      decisions: '/api/decisions',
+    },
+  });
+});
+
 // Health check
 app.get('/health', (_req, res) => {
   res.json({
