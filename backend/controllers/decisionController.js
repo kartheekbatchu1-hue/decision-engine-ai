@@ -1,6 +1,5 @@
-import { query, getClient } from '../config/db.js';
+import { supabase } from '../config/db.js';
 import { analyzeDecisionModel, simulateWeightedScores } from '../services/aiService.js';
-// Groq SDK powers AI analysis — see services/aiService.js
 
 const DEMO_USER_ID = '00000000-0000-0000-0000-000000000001';
 
@@ -10,54 +9,74 @@ function getUserId(req) {
 
 // POST /api/decisions
 export async function createDecision(req, res) {
-  const client = await getClient();
   try {
     const userId = getUserId(req);
     const { title, domain, urgency, problem_statement, alternatives, criteria } = req.validatedData;
 
-    await client.query('BEGIN');
+    if (!supabase) {
+      return res.status(500).json({ error: 'Supabase client is not configured' });
+    }
 
-    const decisionResult = await client.query(
-      `INSERT INTO decision_models (user_id, title, domain, urgency, problem_statement, status)
-       VALUES ($1, $2, $3, $4, $5, 'DRAFT') RETURNING *`,
-      [userId, title, domain, urgency, problem_statement]
-    );
+    // 1. Insert decision model
+    const { data: decision, error: dmError } = await supabase
+      .from('decision_models')
+      .insert({
+        user_id: userId,
+        title,
+        domain,
+        urgency,
+        problem_statement,
+        status: 'DRAFT',
+      })
+      .select()
+      .single();
 
-    const decision = decisionResult.rows[0];
+    if (dmError) throw dmError;
+
     const decisionId = decision.id;
 
-    const insertedAlternatives = [];
-    for (const alt of alternatives) {
-      const r = await client.query(
-        `INSERT INTO decision_alternatives (decision_id, name, description, estimated_cost, time_to_implement_weeks)
-         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [decisionId, alt.name, alt.description || null, alt.estimated_cost ?? null, alt.time_to_implement_weeks ?? null]
-      );
-      insertedAlternatives.push(r.rows[0]);
-    }
+    // 2. Insert alternatives
+    const altsToInsert = alternatives.map(alt => ({
+      decision_id: decisionId,
+      name: alt.name,
+      description: alt.description || null,
+      estimated_cost: alt.estimated_cost ?? null,
+      time_to_implement_weeks: alt.time_to_implement_weeks ?? null,
+    }));
 
-    const insertedCriteria = [];
-    for (const crit of criteria) {
-      const r = await client.query(
-        `INSERT INTO decision_criteria (decision_id, name, weight, is_maximize)
-         VALUES ($1, $2, $3, $4) RETURNING *`,
-        [decisionId, crit.name, crit.weight, crit.is_maximize !== false]
-      );
-      insertedCriteria.push(r.rows[0]);
-    }
+    const { data: insertedAlternatives, error: altError } = await supabase
+      .from('decision_alternatives')
+      .insert(altsToInsert)
+      .select();
 
-    await client.query('COMMIT');
+    if (altError) throw altError;
+
+    // 3. Insert criteria
+    const critsToInsert = criteria.map(crit => ({
+      decision_id: decisionId,
+      name: crit.name,
+      weight: crit.weight,
+      is_maximize: crit.is_maximize !== false,
+    }));
+
+    const { data: insertedCriteria, error: critError } = await supabase
+      .from('decision_criteria')
+      .insert(critsToInsert)
+      .select();
+
+    if (critError) throw critError;
 
     res.status(201).json({
       success: true,
-      data: { ...decision, alternatives: insertedAlternatives, criteria: insertedCriteria },
+      data: {
+        ...decision,
+        alternatives: insertedAlternatives || [],
+        criteria: insertedCriteria || [],
+      },
     });
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error('createDecision error:', err);
     res.status(500).json({ error: 'Failed to create decision', details: err.message });
-  } finally {
-    client.release();
   }
 }
 
@@ -65,20 +84,36 @@ export async function createDecision(req, res) {
 export async function getDecisions(req, res) {
   try {
     const userId = getUserId(req);
-    const result = await query(
-      `SELECT dm.*,
-        COUNT(DISTINCT da.id)::int AS alternative_count,
-        COUNT(DISTINCT dc.id)::int AS criteria_count,
-        (SELECT id FROM decision_analyses WHERE decision_id = dm.id ORDER BY created_at DESC LIMIT 1) AS latest_analysis_id
-       FROM decision_models dm
-       LEFT JOIN decision_alternatives da ON da.decision_id = dm.id
-       LEFT JOIN decision_criteria dc ON dc.decision_id = dm.id
-       WHERE dm.user_id = $1
-       GROUP BY dm.id
-       ORDER BY dm.updated_at DESC`,
-      [userId]
-    );
-    res.json({ success: true, data: result.rows });
+
+    if (!supabase) {
+      return res.status(500).json({ error: 'Supabase client is not configured' });
+    }
+
+    const { data: decisions, error } = await supabase
+      .from('decision_models')
+      .select(`
+        *,
+        decision_alternatives(id),
+        decision_criteria(id),
+        decision_analyses(id, created_at)
+      `)
+      .eq('user_id', userId)
+      .order('updated_at', { ascending: false });
+
+    if (error) throw error;
+
+    const formatted = (decisions || []).map(dm => {
+      const analyses = dm.decision_analyses || [];
+      analyses.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+      return {
+        ...dm,
+        alternative_count: dm.decision_alternatives?.length || 0,
+        criteria_count: dm.decision_criteria?.length || 0,
+        latest_analysis_id: analyses[0]?.id || null,
+      };
+    });
+
+    res.json({ success: true, data: formatted });
   } catch (err) {
     console.error('getDecisions error:', err);
     res.status(500).json({ error: 'Failed to fetch decisions', details: err.message });
@@ -91,29 +126,41 @@ export async function getDecisionById(req, res) {
     const userId = getUserId(req);
     const { id } = req.params;
 
-    const decisionResult = await query(
-      `SELECT * FROM decision_models WHERE id = $1 AND user_id = $2`,
-      [id, userId]
-    );
+    if (!supabase) {
+      return res.status(500).json({ error: 'Supabase client is not configured' });
+    }
 
-    if (!decisionResult.rows.length) {
+    const { data: decision, error: dmError } = await supabase
+      .from('decision_models')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (dmError || !decision) {
       return res.status(404).json({ error: 'Decision not found' });
     }
 
-    const decision = decisionResult.rows[0];
-    const [alts, crits, analyses] = await Promise.all([
-      query(`SELECT * FROM decision_alternatives WHERE decision_id = $1 ORDER BY created_at`, [id]),
-      query(`SELECT * FROM decision_criteria WHERE decision_id = $1 ORDER BY created_at`, [id]),
-      query(`SELECT * FROM decision_analyses WHERE decision_id = $1 ORDER BY created_at DESC LIMIT 1`, [id]),
+    const [
+      { data: alternatives, error: altErr },
+      { data: criteria, error: critErr },
+      { data: analyses, error: anErr },
+    ] = await Promise.all([
+      supabase.from('decision_alternatives').select('*').eq('decision_id', id).order('created_at'),
+      supabase.from('decision_criteria').select('*').eq('decision_id', id).order('created_at'),
+      supabase.from('decision_analyses').select('*').eq('decision_id', id).order('created_at', { ascending: false }).limit(1),
     ]);
+
+    if (altErr) throw altErr;
+    if (critErr) throw critErr;
 
     res.json({
       success: true,
       data: {
         ...decision,
-        alternatives: alts.rows,
-        criteria: crits.rows,
-        analysis: analyses.rows[0] || null,
+        alternatives: alternatives || [],
+        criteria: criteria || [],
+        analysis: analyses?.[0] || null,
       },
     });
   } catch (err) {
@@ -128,19 +175,31 @@ export async function analyzeDecision(req, res) {
     const userId = getUserId(req);
     const { id } = req.params;
 
-    const decisionResult = await query(
-      `SELECT * FROM decision_models WHERE id = $1 AND user_id = $2`,
-      [id, userId]
-    );
-    if (!decisionResult.rows.length) return res.status(404).json({ error: 'Decision not found' });
+    if (!supabase) {
+      return res.status(500).json({ error: 'Supabase client is not configured' });
+    }
 
-    const decision = decisionResult.rows[0];
-    const [alts, crits] = await Promise.all([
-      query(`SELECT * FROM decision_alternatives WHERE decision_id = $1`, [id]),
-      query(`SELECT * FROM decision_criteria WHERE decision_id = $1`, [id]),
+    const { data: decision, error: dmError } = await supabase
+      .from('decision_models')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (dmError || !decision) return res.status(404).json({ error: 'Decision not found' });
+
+    const [
+      { data: alternatives },
+      { data: criteria },
+    ] = await Promise.all([
+      supabase.from('decision_alternatives').select('*').eq('decision_id', id),
+      supabase.from('decision_criteria').select('*').eq('decision_id', id),
     ]);
 
-    if (alts.rows.length < 2) {
+    const alts = alternatives || [];
+    const crits = criteria || [];
+
+    if (alts.length < 2) {
       return res.status(400).json({ error: 'At least 2 alternatives are required for analysis' });
     }
 
@@ -148,44 +207,45 @@ export async function analyzeDecision(req, res) {
       problem_statement: decision.problem_statement,
       domain: decision.domain,
       urgency: decision.urgency,
-      alternatives: alts.rows,
-      criteria: crits.rows,
+      alternatives: alts,
+      criteria: crits,
     });
 
-    const recommendedAlt = alts.rows.find(
+    const recommendedAlt = alts.find(
       a => a.name.toLowerCase() === aiResult.recommended_option_name.toLowerCase()
     );
 
-    const analysisResult = await query(
-      `INSERT INTO decision_analyses
-        (decision_id, recommended_option_id, overall_confidence_score, mcda_scores, risk_assessment, explainable_recommendation, raw_ai_response)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-      [
-        id,
-        recommendedAlt?.id || null,
-        aiResult.confidence_score,
-        JSON.stringify(aiResult.scores),
-        JSON.stringify(aiResult.risks),
-        JSON.stringify({
+    const { data: analysis, error: anError } = await supabase
+      .from('decision_analyses')
+      .insert({
+        decision_id: id,
+        recommended_option_id: recommendedAlt?.id || null,
+        overall_confidence_score: aiResult.confidence_score,
+        mcda_scores: aiResult.scores,
+        risk_assessment: aiResult.risks,
+        explainable_recommendation: {
           executive_summary: aiResult.executive_summary,
           trade_off_analysis: aiResult.trade_off_analysis,
           failure_modes: aiResult.failure_modes || [],
           action_plan: aiResult.action_plan || [],
-        }),
-        JSON.stringify(aiResult),
-      ]
-    );
+        },
+        raw_ai_response: aiResult,
+      })
+      .select()
+      .single();
 
-    await query(
-      `UPDATE decision_models SET status = 'ANALYZED', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
-      [id]
-    );
+    if (anError) throw anError;
 
-    res.json({ success: true, data: { analysis: analysisResult.rows[0], aiResult } });
+    await supabase
+      .from('decision_models')
+      .update({ status: 'ANALYZED', updated_at: new Date().toISOString() })
+      .eq('id', id);
+
+    res.json({ success: true, data: { analysis, aiResult } });
   } catch (err) {
     console.error('analyzeDecision error:', err);
     if (err.message?.includes('API_KEY') || err.message?.includes('credentials') || err.message?.includes('API key')) {
-      return res.status(503).json({ error: 'AI service unavailable. Please configure a valid GEMINI_API_KEY.' });
+      return res.status(503).json({ error: 'AI service unavailable. Please check your GROQ_API_KEY in backend/.env' });
     }
     res.status(500).json({ error: 'Analysis failed', details: err.message });
   }
@@ -198,11 +258,18 @@ export async function simulateDecision(req, res) {
     const { id } = req.params;
     const { criteria_weights, scores } = req.body;
 
-    const decisionResult = await query(
-      `SELECT * FROM decision_models WHERE id = $1 AND user_id = $2`,
-      [id, userId]
-    );
-    if (!decisionResult.rows.length) return res.status(404).json({ error: 'Decision not found' });
+    if (!supabase) {
+      return res.status(500).json({ error: 'Supabase client is not configured' });
+    }
+
+    const { data: decision, error } = await supabase
+      .from('decision_models')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (error || !decision) return res.status(404).json({ error: 'Decision not found' });
 
     if (!criteria_weights || !scores) {
       return res.status(400).json({ error: 'criteria_weights and scores are required' });
@@ -230,11 +297,21 @@ export async function deleteDecision(req, res) {
   try {
     const userId = getUserId(req);
     const { id } = req.params;
-    const result = await query(
-      `DELETE FROM decision_models WHERE id = $1 AND user_id = $2 RETURNING id`,
-      [id, userId]
-    );
-    if (!result.rows.length) return res.status(404).json({ error: 'Decision not found' });
+
+    if (!supabase) {
+      return res.status(500).json({ error: 'Supabase client is not configured' });
+    }
+
+    const { data, error } = await supabase
+      .from('decision_models')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', userId)
+      .select('id');
+
+    if (error) throw error;
+    if (!data?.length) return res.status(404).json({ error: 'Decision not found' });
+
     res.json({ success: true, message: 'Decision deleted successfully' });
   } catch (err) {
     console.error('deleteDecision error:', err);
@@ -248,20 +325,30 @@ export async function updateDecisionStatus(req, res) {
     const userId = getUserId(req);
     const { id } = req.params;
     const { status } = req.body;
+
+    if (!supabase) {
+      return res.status(500).json({ error: 'Supabase client is not configured' });
+    }
+
     const validStatuses = ['DRAFT', 'ANALYZED', 'EXECUTED', 'ARCHIVED'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status', validStatuses });
     }
-    const result = await query(
-      `UPDATE decision_models SET status = $1, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2 AND user_id = $3 RETURNING *`,
-      [status, id, userId]
-    );
-    if (!result.rows.length) return res.status(404).json({ error: 'Decision not found' });
-    res.json({ success: true, data: result.rows[0] });
+
+    const { data, error } = await supabase
+      .from('decision_models')
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .eq('user_id', userId)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Decision not found' });
+
+    res.json({ success: true, data });
   } catch (err) {
     console.error('updateDecisionStatus error:', err);
     res.status(500).json({ error: 'Failed to update status', details: err.message });
   }
 }
-
